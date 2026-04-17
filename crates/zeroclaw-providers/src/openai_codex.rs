@@ -75,13 +75,13 @@ struct ResponsesResponse {
     output_text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ResponsesOutput {
     #[serde(default)]
     content: Vec<ResponsesContent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ResponsesContent {
     #[serde(rename = "type")]
     kind: Option<String>,
@@ -362,10 +362,6 @@ fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
         Some("response.output_text.done") if !saw_delta => {
             nonempty_preserve(event.get("text").and_then(Value::as_str))
         }
-        Some("response.completed" | "response.done") => event
-            .get("response")
-            .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
-            .and_then(|response| extract_responses_text(&response)),
         _ => None,
     }
 }
@@ -374,14 +370,40 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
     let mut saw_delta = false;
     let mut delta_accumulator = String::new();
     let mut fallback_text = None;
+    let mut accumulated_output: Vec<ResponsesOutput> = Vec::new();
     let mut buffer = body.to_string();
 
     let mut process_event = |event: Value| -> anyhow::Result<()> {
         if let Some(message) = extract_stream_error_message(&event) {
             return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
         }
+        let event_type = event.get("type").and_then(Value::as_str);
+
+        if event_type == Some("response.output_item.done") {
+            if let Some(item) = event
+                .get("item")
+                .and_then(|value| serde_json::from_value::<ResponsesOutput>(value.clone()).ok())
+            {
+                accumulated_output.push(item);
+            }
+            return Ok(());
+        }
+
+        if matches!(event_type, Some("response.completed" | "response.done")) {
+            if let Some(mut response) = event
+                .get("response")
+                .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
+            {
+                if response.output.is_empty() && !accumulated_output.is_empty() {
+                    response.output = accumulated_output.clone();
+                }
+                if let Some(text) = extract_responses_text(&response) {
+                    fallback_text.get_or_insert(text);
+                }
+            }
+        }
+
         if let Some(text) = extract_stream_event_text(&event, saw_delta) {
-            let event_type = event.get("type").and_then(Value::as_str);
             if event_type == Some("response.output_text.delta") {
                 saw_delta = true;
                 delta_accumulator.push_str(&text);
@@ -979,6 +1001,20 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn parse_sse_text_backfills_completed_response_output_from_output_items() {
+        let payload = r#"data: {"type":"response.output_item.done","item":{"content":[{"type":"output_text","text":"Recovered output"}]}}
+
+data: {"type":"response.completed","response":{"output":[],"output_text":null}}
+data: [DONE]
+"#;
+
+        assert_eq!(
+            parse_sse_text(payload).unwrap().as_deref(),
+            Some("Recovered output")
+        );
     }
 
     #[test]
