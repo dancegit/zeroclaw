@@ -2,9 +2,12 @@ use crate::ProviderRuntimeOptions;
 use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
-use crate::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, Provider, ProviderCapabilities, StreamChunk,
+    StreamError, StreamEvent, StreamOptions, StreamResult,
+};
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -366,106 +369,243 @@ fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
     }
 }
 
-fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
-    let mut saw_delta = false;
-    let mut delta_accumulator = String::new();
-    let mut fallback_text = None;
-    let mut accumulated_output: Vec<ResponsesOutput> = Vec::new();
-    let mut buffer = body.to_string();
+#[derive(Default)]
+struct CodexStreamState {
+    saw_delta: bool,
+    delta_accumulator: String,
+    fallback_text: Option<String>,
+    accumulated_output: Vec<ResponsesOutput>,
+}
 
-    let mut process_event = |event: Value| -> anyhow::Result<()> {
-        if let Some(message) = extract_stream_error_message(&event) {
-            return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
+async fn process_stream_event(
+    event: Value,
+    state: &mut CodexStreamState,
+    tx: Option<&tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>>,
+    count_tokens: bool,
+) -> Result<(), StreamError> {
+    if let Some(message) = extract_stream_error_message(&event) {
+        return Err(StreamError::Provider(format!(
+            "OpenAI Codex stream error: {message}"
+        )));
+    }
+    let event_type = event.get("type").and_then(Value::as_str);
+
+    if event_type == Some("response.output_item.done") {
+        if let Some(item) = event
+            .get("item")
+            .and_then(|value| serde_json::from_value::<ResponsesOutput>(value.clone()).ok())
+        {
+            state.accumulated_output.push(item);
         }
-        let event_type = event.get("type").and_then(Value::as_str);
+        return Ok(());
+    }
 
-        if event_type == Some("response.output_item.done") {
-            if let Some(item) = event
-                .get("item")
-                .and_then(|value| serde_json::from_value::<ResponsesOutput>(value.clone()).ok())
-            {
-                accumulated_output.push(item);
-            }
-            return Ok(());
+    if matches!(event_type, Some("response.completed" | "response.done"))
+        && let Some(mut response) = event
+            .get("response")
+            .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
+    {
+        if response.output.is_empty() && !state.accumulated_output.is_empty() {
+            response.output = state.accumulated_output.clone();
         }
+        if let Some(text) = extract_responses_text(&response) {
+            state.fallback_text.get_or_insert(text);
+        }
+    }
 
-        if matches!(event_type, Some("response.completed" | "response.done")) {
-            if let Some(mut response) = event
-                .get("response")
-                .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
-            {
-                if response.output.is_empty() && !accumulated_output.is_empty() {
-                    response.output = accumulated_output.clone();
+    if let Some(text) = extract_stream_event_text(&event, state.saw_delta) {
+        if event_type == Some("response.output_text.delta") {
+            state.saw_delta = true;
+            state.delta_accumulator.push_str(&text);
+            if let Some(tx) = tx {
+                let mut chunk = StreamChunk::delta(text);
+                if count_tokens {
+                    chunk = chunk.with_token_estimate();
                 }
-                if let Some(text) = extract_responses_text(&response) {
-                    fallback_text.get_or_insert(text);
-                }
+                tx.send(Ok(StreamEvent::TextDelta(chunk)))
+                    .await
+                    .map_err(|_| StreamError::Provider("stream receiver dropped".to_string()))?;
             }
+        } else if state.fallback_text.is_none() {
+            state.fallback_text = Some(text);
         }
+    }
 
-        if let Some(text) = extract_stream_event_text(&event, saw_delta) {
-            if event_type == Some("response.output_text.delta") {
-                saw_delta = true;
-                delta_accumulator.push_str(&text);
-            } else if fallback_text.is_none() {
-                fallback_text = Some(text);
-            }
+    Ok(())
+}
+
+fn process_stream_event_sync(event: Value, state: &mut CodexStreamState) -> anyhow::Result<()> {
+    if let Some(message) = extract_stream_error_message(&event) {
+        anyhow::bail!("OpenAI Codex stream error: {message}");
+    }
+    let event_type = event.get("type").and_then(Value::as_str);
+
+    if event_type == Some("response.output_item.done") {
+        if let Some(item) = event
+            .get("item")
+            .and_then(|value| serde_json::from_value::<ResponsesOutput>(value.clone()).ok())
+        {
+            state.accumulated_output.push(item);
         }
-        Ok(())
-    };
+        return Ok(());
+    }
 
-    let mut process_chunk = |chunk: &str| -> anyhow::Result<()> {
-        let data_lines: Vec<String> = chunk
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(|line| line.trim().to_string())
-            .collect();
-        if data_lines.is_empty() {
-            return Ok(());
+    if matches!(event_type, Some("response.completed" | "response.done"))
+        && let Some(mut response) = event
+            .get("response")
+            .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
+    {
+        if response.output.is_empty() && !state.accumulated_output.is_empty() {
+            response.output = state.accumulated_output.clone();
         }
-
-        let joined = data_lines.join("\n");
-        let trimmed = joined.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
-            return Ok(());
+        if let Some(text) = extract_responses_text(&response) {
+            state.fallback_text.get_or_insert(text);
         }
+    }
 
-        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
-            return process_event(event);
+    if let Some(text) = extract_stream_event_text(&event, state.saw_delta) {
+        if event_type == Some("response.output_text.delta") {
+            state.saw_delta = true;
+            state.delta_accumulator.push_str(&text);
+        } else if state.fallback_text.is_none() {
+            state.fallback_text = Some(text);
         }
+    }
 
-        for line in data_lines {
-            let line = line.trim();
-            if line.is_empty() || line == "[DONE]" {
-                continue;
-            }
-            if let Ok(event) = serde_json::from_str::<Value>(line) {
-                process_event(event)?;
-            }
-        }
+    Ok(())
+}
 
-        Ok(())
-    };
+fn find_sse_separator(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
+    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
 
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+async fn process_sse_buffer(
+    buffer: &mut String,
+    state: &mut CodexStreamState,
+    tx: Option<&tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>>,
+    count_tokens: bool,
+) -> Result<(), StreamError> {
     loop {
-        let Some(idx) = buffer.find("\n\n") else {
+        let Some((idx, sep_len)) = find_sse_separator(buffer) else {
             break;
         };
 
         let chunk = buffer[..idx].to_string();
-        buffer = buffer[idx + 2..].to_string();
-        process_chunk(&chunk)?;
+        *buffer = buffer[idx + sep_len..].to_string();
+        process_sse_chunk(&chunk, state, tx, count_tokens).await?;
     }
+
+    Ok(())
+}
+
+async fn process_sse_chunk(
+    chunk: &str,
+    state: &mut CodexStreamState,
+    tx: Option<&tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>>,
+    count_tokens: bool,
+) -> Result<(), StreamError> {
+    let data_lines: Vec<String> = chunk
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| line.trim().to_string())
+        .collect();
+    if data_lines.is_empty() {
+        return Ok(());
+    }
+
+    let joined = data_lines.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(());
+    }
+
+    if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+        return process_stream_event(event, state, tx, count_tokens).await;
+    }
+
+    for line in data_lines {
+        let line = line.trim();
+        if line.is_empty() || line == "[DONE]" {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(line) {
+            process_stream_event(event, state, tx, count_tokens).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn process_sse_chunk_sync(chunk: &str, state: &mut CodexStreamState) -> anyhow::Result<()> {
+    let data_lines: Vec<String> = chunk
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| line.trim().to_string())
+        .collect();
+    if data_lines.is_empty() {
+        return Ok(());
+    }
+
+    let joined = data_lines.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(());
+    }
+
+    if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+        return process_stream_event_sync(event, state);
+    }
+
+    for line in data_lines {
+        let line = line.trim();
+        if line.is_empty() || line == "[DONE]" {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(line) {
+            process_stream_event_sync(event, state)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn process_sse_buffer_sync(buffer: &mut String, state: &mut CodexStreamState) -> anyhow::Result<()> {
+    loop {
+        let Some((idx, sep_len)) = find_sse_separator(buffer) else {
+            break;
+        };
+
+        let chunk = buffer[..idx].to_string();
+        *buffer = buffer[idx + sep_len..].to_string();
+        process_sse_chunk_sync(&chunk, state)?;
+    }
+
+    Ok(())
+}
+
+fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
+    let mut state = CodexStreamState::default();
+    let mut buffer = body.to_string();
+
+    process_sse_buffer_sync(&mut buffer, &mut state)?;
 
     if !buffer.trim().is_empty() {
-        process_chunk(&buffer)?;
+        process_sse_chunk_sync(&buffer, &mut state)?;
     }
 
-    if saw_delta {
-        return Ok(nonempty_preserve(Some(&delta_accumulator)));
+    if state.saw_delta {
+        return Ok(nonempty_preserve(Some(&state.delta_accumulator)));
     }
 
-    Ok(fallback_text)
+    Ok(state.fallback_text)
 }
 
 fn extract_stream_error_message(event: &Value) -> Option<String> {
@@ -737,6 +877,77 @@ impl OpenAiCodexProvider {
 
         decode_responses_body(response).await
     }
+
+    async fn build_request_context(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+    ) -> anyhow::Result<(String, Vec<ResponsesInput>, Option<String>, Option<String>, bool)> {
+        let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
+        let profile = match self
+            .auth
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(profile) => profile,
+            Err(err) if use_gateway_api_key_auth => {
+                tracing::warn!(error = %err, "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode");
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        let oauth_access_token = match self
+            .auth
+            .get_valid_openai_access_token(self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(token) => token,
+            Err(err) if use_gateway_api_key_auth => {
+                tracing::warn!(error = %err, "failed to refresh OpenAI token; continuing with custom endpoint API key mode");
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        let account_id = profile.and_then(|profile| profile.account_id).or_else(|| {
+            oauth_access_token
+                .as_deref()
+                .and_then(extract_account_id_from_jwt)
+        });
+        let access_token = if use_gateway_api_key_auth {
+            oauth_access_token
+        } else {
+            Some(oauth_access_token.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+                )
+            })?)
+        };
+        let account_id = if use_gateway_api_key_auth {
+            account_id
+        } else {
+            Some(account_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."
+                )
+            })?)
+        };
+
+        let prepared = multimodal::prepare_messages_for_provider(
+            messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await?;
+        let (instructions, input) = build_responses_input(&prepared.messages);
+
+        Ok((
+            instructions,
+            input,
+            access_token,
+            account_id,
+            use_gateway_api_key_auth,
+        ))
+    }
 }
 
 #[async_trait]
@@ -747,6 +958,205 @@ impl Provider for OpenAiCodexProvider {
             vision: true,
             prompt_caching: false,
         }
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let normalized_model = normalize_model_id(model).to_string();
+        let messages = request.messages.to_vec();
+        let auth = self.auth.clone();
+        let auth_profile_override = self.auth_profile_override.clone();
+        let custom_endpoint = self.custom_endpoint;
+        let gateway_api_key = self.gateway_api_key.clone();
+        let reasoning_effort = self.reasoning_effort.clone();
+        let client = self.client.clone();
+        let responses_url = self.responses_url.clone();
+        let count_tokens = options.count_tokens;
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+        tokio::spawn(async move {
+            let helper = OpenAiCodexProvider {
+                auth,
+                auth_profile_override,
+                responses_url: responses_url.clone(),
+                custom_endpoint,
+                gateway_api_key: gateway_api_key.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                client: client.clone(),
+            };
+
+            let (instructions, input, access_token, account_id, use_gateway_api_key_auth) =
+                match helper.build_request_context(&messages, &normalized_model).await {
+                    Ok(ctx) => ctx,
+                    Err(error) => {
+                        let _ = tx.send(Err(StreamError::Provider(error.to_string()))).await;
+                        return;
+                    }
+                };
+
+            let request = ResponsesRequest {
+                model: normalized_model.clone(),
+                input,
+                instructions,
+                store: false,
+                stream: true,
+                text: ResponsesTextOptions {
+                    verbosity: "medium".to_string(),
+                },
+                reasoning: ResponsesReasoningOptions {
+                    effort: resolve_reasoning_effort(&normalized_model, reasoning_effort.as_deref()),
+                    summary: "auto".to_string(),
+                },
+                include: vec!["reasoning.encrypted_content".to_string()],
+                tool_choice: "auto".to_string(),
+                parallel_tool_calls: true,
+            };
+
+            let bearer_token = if use_gateway_api_key_auth {
+                gateway_api_key.clone().unwrap_or_default()
+            } else {
+                access_token.clone().unwrap_or_default()
+            };
+
+            let mut request_builder = client
+                .post(&responses_url)
+                .header("Authorization", format!("Bearer {bearer_token}"))
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "pi")
+                .header("accept", "text/event-stream")
+                .header("Content-Type", "application/json");
+
+            if let Some(account_id) = account_id.as_deref() {
+                request_builder = request_builder.header("chatgpt-account-id", account_id);
+            }
+            if use_gateway_api_key_auth {
+                if let Some(access_token) = access_token.as_deref() {
+                    request_builder =
+                        request_builder.header("x-openai-access-token", access_token);
+                }
+                if let Some(account_id) = account_id.as_deref() {
+                    request_builder = request_builder.header("x-openai-account-id", account_id);
+                }
+            }
+
+            let response = match request_builder.json(&request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            let mut state = CodexStreamState::default();
+            let mut buffer = String::new();
+            let mut pending_utf8 = Vec::new();
+            let mut stream = response.bytes_stream();
+            let mut emitted_delta = false;
+
+            while let Some(chunk) = stream.next().await {
+                let bytes = match chunk {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        if emitted_delta {
+                            let _ = tx.send(Ok(StreamEvent::Final)).await;
+                        } else {
+                            let _ = tx
+                                .send(Err(StreamError::Provider(format!(
+                                    "error reading OpenAI Codex response stream: {err}"
+                                ))))
+                                .await;
+                        }
+                        return;
+                    }
+                };
+
+                if let Err(err) = append_utf8_stream_chunk(&mut buffer, &mut pending_utf8, &bytes)
+                {
+                    if emitted_delta {
+                        let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    } else {
+                        let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                    }
+                    return;
+                }
+
+                if let Err(err) = process_sse_buffer(&mut buffer, &mut state, Some(&tx), count_tokens).await {
+                    if emitted_delta || state.saw_delta {
+                        let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    } else {
+                        let _ = tx.send(Err(err)).await;
+                    }
+                    return;
+                }
+                emitted_delta |= state.saw_delta;
+            }
+
+            if !pending_utf8.is_empty() {
+                let err = std::str::from_utf8(&pending_utf8)
+                    .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+                if emitted_delta {
+                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                } else {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+                        ))))
+                        .await;
+                }
+                return;
+            }
+
+            if !buffer.trim().is_empty() {
+                if let Err(err) = process_sse_chunk(&buffer, &mut state, Some(&tx), count_tokens).await {
+                    if emitted_delta || state.saw_delta {
+                        let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    } else {
+                        let _ = tx.send(Err(err)).await;
+                    }
+                    return;
+                }
+            }
+
+            if !state.saw_delta {
+                if let Some(text) = state.fallback_text.take() {
+                    let mut chunk = StreamChunk::delta(text);
+                    if count_tokens {
+                        chunk = chunk.with_token_estimate();
+                    }
+                    let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
+                }
+            }
+
+            let _ = tx.send(Ok(StreamEvent::Final)).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|event| (event, rx)) })
+            .boxed()
     }
 
     async fn chat_with_system(
@@ -1178,5 +1588,12 @@ data: [DONE]
 
         assert!(!caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[tokio::test]
+    async fn supports_streaming_returns_true() {
+        let options = ProviderRuntimeOptions::default();
+        let provider = OpenAiCodexProvider::new(&options, None).unwrap();
+        assert!(provider.supports_streaming());
     }
 }
