@@ -1,0 +1,77 @@
+name: Publish Fork Latest Artifact
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,whatsapp-web
+
+jobs:
+  build-linux-x64:
+    name: Build Linux x86_64 tarball
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fork-latest-linux-x64
+
+      - name: Build release
+        run: cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target x86_64-unknown-linux-gnu
+
+      - name: Package tarball
+        run: |
+          mkdir -p staging
+          cp target/x86_64-unknown-linux-gnu/release/zeroclaw staging/
+          cd staging
+          tar czf ../zeroclaw-x86_64-unknown-linux-gnu.tar.gz zeroclaw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+          retention-days: 7
+
+  publish:
+    name: Publish rolling latest release
+    needs: [build-linux-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: release-assets
+
+      - name: Create unique release tag
+        id: tag
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          tag="fork-master-${short_sha}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release create "$TAG" release-assets/zeroclaw-x86_64-unknown-linux-gnu.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "Rolling latest fork build for ${GITHUB_SHA}" \
+            --latest
