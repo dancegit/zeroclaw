@@ -1779,6 +1779,7 @@ pub async fn run_tool_call_loop(
         // Collect tool results and build per-tool output for loop detection.
         // Only non-ignored tool outputs contribute to the identical-output hash.
         let mut detection_relevant_output = String::new();
+        let mut detection_identity = String::new();
         // Use enumerate *before* filter_map so result_index stays aligned with
         // tool_calls even when some ordered_results entries are None.
         for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
@@ -1794,6 +1795,12 @@ pub async fn run_tool_call_loop(
                     .get(result_index)
                     .map(|c| &c.arguments)
                     .unwrap_or(&serde_json::Value::Null);
+                detection_identity.push_str(&tool_name);
+                detection_identity.push('\n');
+                detection_identity.push_str(&serde_json::to_string(args).unwrap_or_default());
+                detection_identity.push('\n');
+                detection_identity.push_str(&outcome.output);
+                detection_identity.push('\n');
                 let det_result = loop_detector.record(&tool_name, args, &outcome.output);
                 match det_result {
                     crate::agent::loop_detector::LoopDetectionResult::Ok => {}
@@ -1852,7 +1859,7 @@ pub async fn run_tool_call_loop(
         if loop_detection_active && !detection_relevant_output.is_empty() {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            detection_relevant_output.hash(&mut hasher);
+            detection_identity.hash(&mut hasher);
             let current_hash = hasher.finish();
 
             if last_tool_output_hash == Some(current_hash) {

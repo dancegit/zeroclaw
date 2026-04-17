@@ -6,12 +6,12 @@
 //! 1. **Exact repeat** — same tool + args called 3+ times consecutively.
 //! 2. **Ping-pong** — two tools alternating (A->B->A->B) for 4+ cycles.
 //! 3. **No progress** — same tool called 5+ times with different args but
-//!    identical result hash each time.
+//!    identical call identity each time.
 //!
 //! Detection triggers escalating responses: `Warning` -> `Block` -> `Break`.
 
-use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 // ── Configuration ────────────────────────────────────────────────
@@ -63,7 +63,7 @@ struct ToolCallRecord {
     name: String,
     /// Hash of the serialised arguments.
     args_hash: u64,
-    /// Hash of the tool's output/result.
+    /// Hash of the tool's full call identity (tool + args + output).
     result_hash: u64,
 }
 
@@ -96,9 +96,11 @@ fn canonicalise(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn hash_str(s: &str) -> u64 {
+fn hash_tool_call_identity(name: &str, args: &serde_json::Value, result: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
+    name.hash(&mut hasher);
+    hash_value(args).hash(&mut hasher);
+    result.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -137,7 +139,7 @@ impl LoopDetector {
         let record = ToolCallRecord {
             name: name.to_string(),
             args_hash: hash_value(args),
-            result_hash: hash_str(result),
+            result_hash: hash_tool_call_identity(name, args, result),
         };
 
         // Maintain sliding window.
@@ -477,47 +479,27 @@ mod tests {
         }
     }
 
-    // ── No-progress tests ────────────────────────────────────────
+    // ── Call-identity tests ──────────────────────────────────────
 
     #[test]
-    fn no_progress_warning_at_five_different_args_same_result() {
+    fn different_args_same_output_no_longer_trigger_no_progress() {
         let mut det = LoopDetector::new(default_config());
 
-        for i in 0..5 {
+        for i in 0..8 {
             let args = json!({"query": format!("attempt_{i}")});
             let result = det.record("search", &args, "no results found");
-            if i < 4 {
-                assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
-            } else {
-                match result {
-                    LoopDetectionResult::Warning(msg) => {
-                        assert!(msg.contains("search"));
-                        assert!(msg.contains("identical results"));
-                    }
-                    other => panic!("expected Warning, got {other:?}"),
-                }
-            }
+            assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
         }
     }
 
     #[test]
-    fn no_progress_escalates_to_block_and_break() {
+    fn different_args_same_output_no_longer_breaks() {
         let mut det = LoopDetector::new(default_config());
 
-        // 6 calls with different args, same result.
-        for i in 0..6 {
+        for i in 0..10 {
             let args = json!({"q": format!("v{i}")});
-            det.record("web_fetch", &args, "timeout");
-        }
-        // 7th call: count=7 which is >= MIN_CALLS(5)+2 -> Break.
-        let r7 = det.record("web_fetch", &json!({"q": "v6"}), "timeout");
-        match r7 {
-            LoopDetectionResult::Break(msg) => {
-                assert!(msg.contains("web_fetch"));
-                assert!(msg.contains("7 times"));
-                assert!(msg.contains("no progress"));
-            }
-            other => panic!("expected Break at 7 calls, got {other:?}"),
+            let result = det.record("web_fetch", &args, "timeout");
+            assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
         }
     }
 
