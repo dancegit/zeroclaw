@@ -364,6 +364,10 @@ enum EditMessageResult {
 }
 
 impl TelegramChannel {
+    fn sanitize_draft_text(text: &str) -> String {
+        strip_tool_call_tags(text)
+    }
+
     pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
         let pairing = if normalized_allowed.is_empty() {
@@ -2434,6 +2438,7 @@ impl Channel for TelegramChannel {
         text: &str,
     ) -> anyhow::Result<()> {
         let (chat_id, _) = Self::parse_reply_target(recipient);
+        let sanitized = Self::sanitize_draft_text(text);
 
         // Rate-limit edits per chat
         {
@@ -2447,18 +2452,18 @@ impl Channel for TelegramChannel {
         }
 
         // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
-        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+        let display_text = if sanitized.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
             let mut end = 0;
-            for (idx, ch) in text.char_indices() {
+            for (idx, ch) in sanitized.char_indices() {
                 let next = idx + ch.len_utf8();
                 if next > TELEGRAM_MAX_MESSAGE_LENGTH {
                     break;
                 }
                 end = next;
             }
-            &text[..end]
+            &sanitized[..end]
         } else {
-            text
+            &sanitized
         };
 
         let message_id_parsed = match message_id.parse::<i64>() {
@@ -3322,6 +3327,13 @@ mod tests {
             .update_draft("123", "not-a-number", &long_emoji_text)
             .await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sanitize_draft_text_drops_malformed_tool_prefixes() {
+        let input = "Done so far\n<tool<";
+        let result = TelegramChannel::sanitize_draft_text(input);
+        assert_eq!(result, "Done so far");
     }
 
     #[tokio::test]
