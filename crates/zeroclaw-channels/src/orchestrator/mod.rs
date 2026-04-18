@@ -472,8 +472,23 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
         "<tool>",
         "<invoke>",
     ];
+    const TOOL_CALL_PREFIXES: [&str; 7] = [
+        "<function_calls",
+        "<function_call",
+        "<tool_call",
+        "<toolcall",
+        "<tool-call",
+        "<tool",
+        "<invoke",
+    ];
 
     fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+        tags.iter()
+            .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
+            .min_by_key(|(idx, _)| *idx)
+    }
+
+    fn find_first_prefix<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
         tags.iter()
             .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
             .min_by_key(|(idx, _)| *idx)
@@ -553,9 +568,17 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
             continue;
         }
 
-        kept_segments.push(remaining[start..].to_string());
+        tracing::warn!(open_tag = %open_tag, "dropping malformed trailing tool-call markup from outbound message");
         remaining = "";
         break;
+    }
+
+    if let Some((start, open_tag)) = find_first_prefix(remaining, &TOOL_CALL_PREFIXES) {
+        if !remaining[..start].is_empty() {
+            kept_segments.push(remaining[..start].to_string());
+        }
+        tracing::warn!(open_tag = %open_tag, "dropping malformed trailing tool-call prefix from outbound message");
+        remaining = "";
     }
 
     if !remaining.is_empty() {
@@ -10177,6 +10200,13 @@ Done reminder set for 1:38 AM."#;
             normalized,
             "Let me create the reminder properly:\nDone reminder set for 1:38 AM."
         );
+    }
+
+    #[test]
+    fn strip_tool_call_tags_drops_malformed_trailing_tool_markup() {
+        let input = "Done so far\n<tool<";
+        let result = strip_tool_call_tags(input);
+        assert_eq!(result, "Done so far");
     }
 
     #[test]
